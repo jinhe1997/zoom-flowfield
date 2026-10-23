@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flow Field</title>
+<style>
+html,body{margin:0;height:100%;background:#05060a;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#cfd6e6}
+canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+.hud{position:fixed;left:12px;top:10px;font-size:12px;opacity:.75;pointer-events:none;letter-spacing:.04em;transition:opacity 1.5s}
+.btns{position:fixed;right:10px;bottom:10px;display:flex;gap:6px}
+button{background:rgba(255,255,255,.08);color:#cfd6e6;border:1px solid rgba(255,255,255,.18);border-radius:6px;padding:6px 10px;font:inherit;font-size:12px;cursor:pointer}
+button:hover{background:rgba(255,255,255,.16)}
+#diag{position:fixed;right:10px;bottom:48px;width:min(360px,calc(100% - 20px));max-height:calc(100% - 70px);overflow:auto;background:rgba(10,12,20,.94);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 12px;font-size:12px;display:none;box-sizing:border-box}
+#diag.show{display:block}
+#diag table{width:100%;border-collapse:collapse}
+#diag td{padding:3px 0;vertical-align:top}
+#diag td:last-child{text-align:right;padding-left:10px;word-break:break-all}
+.ok{color:#6ee7a8}.bad{color:#ff7a8a}.wait{color:#f5c26b}.info{color:#9fb3d9}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud" id="hud">move: swirl &nbsp;/&nbsp; click: burst &nbsp;/&nbsp; space: palette &nbsp;/&nbsp; D: diagnostics</div>
+<div id="diag"><table id="dt"></table></div>
+<div class="btns"><button id="bp">palette</button><button id="bd">diagnostics</button></div>
+<script>
+(() => {
+  // ---------- diagnostics panel ----------
+  const dt = document.getElementById('dt');
+  const rows = {};
+  const diag = {
+    set(k, v, cls) {
+      let cell = rows[k];
+      if (!cell) {
+        const tr = document.createElement('tr');
+        const a = document.createElement('td'), b = document.createElement('td');
+        a.textContent = k; tr.append(a, b); dt.appendChild(tr);
+        cell = rows[k] = b;
+      }
+      cell.textContent = v; cell.className = cls || '';
+    },
+    mark(k) { if (rows[k] && rows[k].className === 'ok') return; this.set(k, 'received', 'ok'); }
+  };
+  const diagEl = document.getElementById('diag');
+  const toggleDiag = () => diagEl.classList.toggle('show');
+
+  // ---------- canvas + particles ----------
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+  const palettes = [[185, 285], [345, 420], [100, 190], [20, 60]]; // hue ranges
+  let pal = 0;
+  const parts = [], rings = [];
+  const ptr = { x: -1e4, y: -1e4, active: false };
+
+  const spawn = () => ({ x: Math.random() * W, y: Math.random() * H, vx: 0, vy: 0, life: Math.random() * 300 + 100, h: Math.random() });
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = cv.clientWidth; H = cv.clientHeight;
+    cv.width = Math.max(1, (W * DPR) | 0); cv.height = Math.max(1, (H * DPR) | 0);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#05060a'; ctx.fillRect(0, 0, W, H);
+    const target = Math.min(2500, Math.max(300, (W * H / 600) | 0));
+    while (parts.length < target) parts.push(spawn());
+    parts.length = target;
+    diag.set('viewport', `${W} x ${H} @${DPR}x`, 'info');
+  }
+
+  // cheap smooth pseudo-noise field, animated over time
+  const field = (x, y, t) =>
+    (Math.sin(x * 0.0031 + t * 0.21) + Math.cos(y * 0.0027 - t * 0.17) + Math.sin((x + y) * 0.0017 + t * 0.11)) * Math.PI;
+
+  const t0 = performance.now();
+  let last = t0, frames = 0, fpsT = t0;
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    const t = (now - t0) / 1000;
+    const k = dt * 60, damp = Math.pow(0.94, k);
+
+    frames++;
+    if (now - fpsT > 500) {
+      const fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now;
+      diag.set('fps', fps.toFixed(0), fps > 45 ? 'ok' : fps > 25 ? 'wait' : 'bad');
+    }
+
+    // fade previous frame for trails
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(5,6,10,0.09)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 1;
+
+    const [h0, h1] = palettes[pal];
+    for (const p of parts) {
+      const ang = field(p.x, p.y, t);
+      p.vx += Math.cos(ang) * 0.12 * k;
+      p.vy += Math.sin(ang) * 0.12 * k;
+
+      if (ptr.active) { // swirl around pointer, slight pull inward
+        const dx = p.x - ptr.x, dy = p.y - ptr.y, d2 = dx * dx + dy * dy;
+        if (d2 < 40000) {
+          const d = Math.sqrt(d2) + 1, f = (1 - d / 200) * 1.4 * k;
+          p.vx += (-dy / d) * f - (dx / d) * f * 0.25;
+          p.vy += (dx / d) * f - (dy / d) * f * 0.25;
+        }
+      }
+
+      p.vx *= damp; p.vy *= damp;
+      const ox = p.x, oy = p.y;
+      p.x += p.vx * k; p.y += p.vy * k; p.life -= k;
+      if (p.life < 0 || p.x < -10 || p.x > W + 10 || p.y < -10 || p.y > H + 10) { Object.assign(p, spawn()); continue; }
+
+      const sp = Math.min(1, Math.hypot(p.vx, p.vy) / 6);
+      const hue = (h0 + (h1 - h0) * (p.h * 0.6 + sp * 0.4)) % 360;
+      ctx.strokeStyle = `hsla(${hue},90%,${45 + sp * 25}%,${0.25 + sp * 0.5})`;
+      ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(p.x, p.y); ctx.stroke();
+    }
+
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const r = rings[i];
+      r.r += 6 * k; r.a -= 0.02 * k;
+      if (r.a <= 0) { rings.splice(i, 1); continue; }
+      ctx.strokeStyle = `hsla(${r.h},90%,65%,${r.a})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- interaction ----------
+  let ac = null;
+  function sfx() {
+    try {
+      if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+      if (ac.state === 'suspended') ac.resume();
+      const o = ac.createOscillator(), g = ac.createGain(), now = ac.currentTime;
+      const f = 180 + Math.random() * 120;
+      o.type = 'sine';
+      o.frequency.setValueAtTime(f * 2, now);
+      o.frequency.exponentialRampToValueAtTime(f * 0.5, now + 0.35);
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(0.15, now + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.4);
+      o.connect(g).connect(ac.destination);
+      o.start(now); o.stop(now + 0.45);
+      setTimeout(() => diag.set('audio', ac.state, ac.state === 'running' ? 'ok' : 'bad'), 80);
+    } catch (e) { diag.set('audio', 'error: ' + e.message, 'bad'); }
+  }
+
+  function burst(x, y) {
+    for (const p of parts) {
+      const dx = p.x - x, dy = p.y - y, d = Math.hypot(dx, dy) + 1;
+      if (d < 260) { const f = (1 - d / 260) * 14; p.vx += dx / d * f; p.vy += dy / d * f; }
+    }
+    const [h0, h1] = palettes[pal];
+    rings.push({ x, y, r: 4, a: 0.9, h: ((h0 + h1) / 2) % 360 });
+    sfx();
+  }
+
+  const nextPal = () => { pal = (pal + 1) % palettes.length; };
+
+  cv.addEventListener('pointermove', e => { ptr.x = e.offsetX; ptr.y = e.offsetY; ptr.active = true; diag.mark('pointer move'); });
+  cv.addEventListener('pointerleave', () => { ptr.active = false; });
+  cv.addEventListener('pointerdown', e => { ptr.x = e.offsetX; ptr.y = e.offsetY; ptr.active = true; burst(e.offsetX, e.offsetY); diag.mark('pointer down'); });
+  cv.addEventListener('pointerup', e => { if (e.pointerType !== 'mouse') ptr.active = false; });
+  window.addEventListener('keydown', e => {
+    diag.set('keyboard', 'received (' + e.key + ')', 'ok');
+    if (e.code === 'Space') { e.preventDefault(); nextPal(); }
+    else if (e.key === 'd' || e.key === 'D') toggleDiag();
+  });
+  document.getElementById('bp').addEventListener('click', nextPal);
+  document.getElementById('bd').addEventListener('click', toggleDiag);
+  window.addEventListener('resize', resize);
+  setTimeout(() => { document.getElementById('hud').style.opacity = '0'; }, 7000);
+
+  // ---------- environment checks ----------
+  function runChecks() {
+    diag.set('javascript', 'running', 'ok');
+    let framed; try { framed = window.self !== window.top; } catch (e) { framed = true; }
+    diag.set('inside iframe', framed ? 'yes' : 'no', 'info');
+    try { void window.top.location.href; diag.set('parent access', 'same-origin', 'info'); }
+    catch (e) { diag.set('parent access', 'cross-origin', 'info'); }
+    diag.set('origin', String(location.origin), 'info');
+
+    try { localStorage.setItem('__t', '1'); localStorage.removeItem('__t'); diag.set('localStorage', 'ok', 'ok'); }
+    catch (e) { diag.set('localStorage', 'blocked', 'bad'); }
+    try {
+      document.cookie = '__t=1; SameSite=None; Secure';
+      const ok = document.cookie.includes('__t=1');
+      diag.set('cookie', ok ? 'ok' : 'not stored', ok ? 'ok' : 'bad');
+    } catch (e) { diag.set('cookie', 'blocked', 'bad'); }
+
+    const gl2 = document.createElement('canvas').getContext('webgl2');
+    diag.set('WebGL2', gl2 ? 'ok' : 'unavailable', gl2 ? 'ok' : 'bad');
+    if (gl2) {
+      const ext = gl2.getExtension('WEBGL_debug_renderer_info');
+      if (ext) diag.set('GPU', gl2.getParameter(ext.UNMASKED_RENDERER_WEBGL), 'info');
+    }
+    const wasm = typeof WebAssembly === 'object';
+    diag.set('WebAssembly', wasm ? 'ok' : 'unavailable', wasm ? 'ok' : 'bad');
+    diag.set('fullscreen', document.fullscreenEnabled ? 'allowed' : 'not allowed', document.fullscreenEnabled ? 'ok' : 'bad');
+    diag.set('clipboard API', navigator.clipboard ? 'present' : 'absent', navigator.clipboard ? 'ok' : 'bad');
+
+    diag.set('audio', 'click canvas to test', 'wait');
+    diag.set('pointer move', 'waiting', 'wait');
+    diag.set('pointer down', 'waiting', 'wait');
+    diag.set('keyboard', 'click, then press a key', 'wait');
+
+    diag.set('fetch', 'testing...', 'wait');
+    const ctl = new AbortController(); setTimeout(() => ctl.abort(), 6000);
+    fetch('https://api.github.com/zen', { signal: ctl.signal, cache: 'no-store' })
+      .then(r => diag.set('fetch', 'ok (' + r.status + ')', r.ok ? 'ok' : 'wait'))
+      .catch(() => diag.set('fetch', 'blocked / failed', 'bad'));
+
+    diag.set('WebSocket', 'testing...', 'wait');
+    try {
+      const ws = new WebSocket('wss://ws.postman-echo.com/raw');
+      const to = setTimeout(() => { diag.set('WebSocket', 'timeout', 'bad'); try { ws.close(); } catch (_) {} }, 7000);
+      ws.onopen = () => ws.send('ping');
+      ws.onmessage = () => { clearTimeout(to); diag.set('WebSocket', 'ok (echo)', 'ok'); ws.close(); };
+      ws.onerror = () => { clearTimeout(to); diag.set('WebSocket', 'blocked / failed', 'bad'); };
+    } catch (e) { diag.set('WebSocket', 'blocked', 'bad'); }
+
+    diag.set('user agent', navigator.userAgent, 'info');
+  }
+
+  resize();
+  runChecks();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
